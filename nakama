@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nakama 仲間 — talk to one captain, ship with a crew.
+# nakama — talk to one captain, ship with a crew.
 # MVP crew runner: herdr backend, pi agents, git-worktree isolation.
 set -euo pipefail
 

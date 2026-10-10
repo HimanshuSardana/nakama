@@ -1,4 +1,4 @@
-# nakama 仲間
+# nakama
 
 Talk to one captain. Ship with a crew.
 
