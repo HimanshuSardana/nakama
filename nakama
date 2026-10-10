@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# nakama 仲間 — talk to one captain, ship with a crew.
+# MVP crew runner: herdr backend, pi agents, git-worktree isolation.
+set -euo pipefail
+
+VERSION="0.1.0"
+NAKAMA_HOME="${NAKAMA_HOME:-$HOME/.config/nakama}"
+CREWS_DIR="$NAKAMA_HOME/crews"
+TREES_DIR="$NAKAMA_HOME/trees"
+FLEET_LABEL="nakama-fleet"
+
+die() { echo "nakama: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+usage() {
+  cat <<EOF
+nakama $VERSION — talk to one captain, ship with a crew.
+
+Usage:
+  nakama spawn --repo PATH [--kind ship|scout] --brief TEXT [--base BRANCH] [--label NAME]
+  nakama list
+  nakama read <id> [--lines N]
+  nakama wait <id> [--timeout MS]
+  nakama collect <id>
+  nakama retire <id> [--drop-branch]
+
+State: \$NAKAMA_HOME ($NAKAMA_HOME)
+Docs: AGENTS.md is the captain's contract; skills/ship + skills/scout are task contracts.
+EOF
+}
+
+task_file() { echo "$CREWS_DIR/$1/task.json"; }
+load_field() { jq -r ".$2 // empty" "$(task_file "$1")"; }
+
+fleet_workspace() {
+  local ws
+  ws=$(herdr workspace list 2>/dev/null \
+    | jq -r --arg label "$FLEET_LABEL" \
+      '.result.workspaces[] | select(.label == $label) | .workspace_id' \
+    | head -n 1)
+  if [[ -z "$ws" ]]; then
+    ws=$(herdr workspace create --cwd "$HOME" --label "$FLEET_LABEL" --no-focus \
+      | jq -r '.result.workspace.workspace_id')
+    [[ -n "$ws" && "$ws" != "null" ]] || die "could not create fleet workspace"
+  fi
+  echo "$ws"
+}
+
+cmd_spawn() {
+  local repo="" kind="ship" brief="" base="" label=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --kind) kind="$2"; shift 2 ;;
+      --brief) brief="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      --label) label="$2"; shift 2 ;;
+      *) die "spawn: unknown flag $1" ;;
+    esac
+  done
+  [[ -n "$repo" ]] || die "spawn: --repo is required"
+  [[ -d "$repo/.git" || -f "$repo/.git" ]] || die "spawn: not a git repo: $repo"
+  [[ "$kind" == "ship" || "$kind" == "scout" ]] || die "spawn: --kind must be ship|scout"
+  [[ -n "$brief" ]] || die "spawn: --brief is required"
+  if [[ -z "$base" ]]; then
+    base=$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null \
+      || git -C "$repo" rev-parse --short HEAD)
+  fi
+
+  local id="nk-$(date +%y%m%d)-$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  local agent="$id" tree="$TREES_DIR/$id" crew="$CREWS_DIR/$id"
+  [[ -z "$label" ]] && label="$id"
+  mkdir -p "$crew" "$TREES_DIR"
+
+  if [[ "$kind" == "ship" ]]; then
+    git -C "$repo" worktree add -b "nakama/$id" "$tree" "$base" >&2 \
+      || die "could not create worktree"
+  else
+    git -C "$repo" worktree add --detach "$tree" "$base" >&2 \
+      || die "could not create worktree"
+  fi
+
+  {
+    echo "# nakama $id ($kind)"
+    echo
+    echo "- repo: $repo"
+    echo "- base: $base"
+    [[ "$kind" == "ship" ]] && echo "- branch: nakama/$id"
+    echo
+    echo "$brief"
+  } >"$crew/brief.md"
+
+  local ws tab pane
+  ws=$(fleet_workspace)
+  local out
+  out=$(herdr tab create --workspace "$ws" --cwd "$tree" --label "$label" --no-focus)
+  tab=$(echo "$out" | jq -r '.result.tab.tab_id')
+  pane=$(echo "$out" | jq -r '.result.root_pane.pane_id')
+  [[ -n "$tab" && "$tab" != "null" ]] || die "could not create tab (ws=$ws)"
+  [[ -n "$pane" && "$pane" != "null" ]] || die "could not find root pane (tab=$tab)"
+
+  herdr agent start "$agent" --kind pi --pane "$pane" >&2 \
+    || die "agent start failed in $pane (is the pane at a shell prompt?)"
+  herdr agent prompt "$agent" -- "$(cat "$crew/brief.md")" >&2 \
+    || die "agent prompt failed for $agent"
+
+  jq -n --arg id "$id" --arg kind "$kind" --arg repo "$repo" \
+    --arg base "$base" --arg branch "nakama/$id" --arg agent "$agent" \
+    --arg workspace "$ws" --arg tab "$tab" --arg pane "$pane" \
+    --arg status "sailing" \
+    '{id:$id,kind:$kind,repo:$repo,base:$base,branch:$branch,
+      agent:$agent,workspace:$workspace,tab:$tab,pane:$pane,status:$status}' \
+    >"$(task_file "$id")"
+
+  echo "$id"
+}
+
+cmd_list() {
+  need jq
+  local agents
+  agents=$(herdr agent list 2>/dev/null || echo '{}')
+  printf '%-18s %-6s %-10s %-30s %s\n' "ID" "KIND" "STATUS" "AGENT/TAB" "REPO"
+  for f in "$CREWS_DIR"/*/task.json; do
+    [[ -f "$f" ]] || continue
+    local id kind repo agent tab live
+    id=$(jq -r '.id' "$f"); kind=$(jq -r '.kind' "$f")
+    repo=$(jq -r '.repo' "$f"); agent=$(jq -r '.agent' "$f")
+    tab=$(jq -r '.tab' "$f")
+    live=$(echo "$agents" | jq -r --arg a "$agent" \
+      '.result.agents[]? | select(.agent == $a) | .agent_status')
+    [[ -z "$live" ]] && live=$(jq -r '.status' "$f")
+    printf '%-18s %-6s %-10s %-30s %s\n' "$id" "$kind" "$live" "$agent/$tab" "$repo"
+  done
+}
+
+main() {
+  need herdr; need git; need jq
+  mkdir -p "$CREWS_DIR" "$TREES_DIR"
+  local cmd="${1:-}"; [[ -n "$cmd" ]] || { usage; exit 0; }
+  shift || true
+  case "$cmd" in
+    spawn) cmd_spawn "$@" ;;
+    list) cmd_list ;;
+    -h|--help|help) usage ;;
+    -V|--version|version) echo "nakama $VERSION" ;;
+    *) die "unknown command: $cmd (see nakama --help)" ;;
+  esac
+}
+
+main "$@"
