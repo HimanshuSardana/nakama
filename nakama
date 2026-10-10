@@ -133,6 +133,73 @@ cmd_list() {
   done
 }
 
+cmd_read() {
+  local id="${1:-}" lines="120"; shift || true
+  [[ -n "$id" ]] || die "read: <id> is required"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --lines) lines="$2"; shift 2 ;; *) die "read: unknown flag $1" ;; esac
+  done
+  herdr agent read "$(load_field "$id" agent)" --source recent-unwrapped --lines "$lines"
+}
+
+cmd_wait() {
+  local id="${1:-}" timeout="1800000"; shift || true
+  [[ -n "$id" ]] || die "wait: <id> is required"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --timeout) timeout="$2"; shift 2 ;; *) die "wait: unknown flag $1" ;; esac
+  done
+  herdr agent wait "$(load_field "$id" agent)" --timeout "$timeout"
+}
+
+cmd_collect() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "collect: <id> is required"
+  local kind repo base branch tree agent
+  kind=$(load_field "$id" kind); repo=$(load_field "$id" repo)
+  base=$(load_field "$id" base); branch=$(load_field "$id" branch)
+  agent=$(load_field "$id" agent); tree="$TREES_DIR/$id"
+  if [[ "$kind" == "scout" ]]; then
+    if [[ -f "$CREWS_DIR/$id/report.md" ]]; then
+      cat "$CREWS_DIR/$id/report.md"
+    else
+      echo "--- no report.md yet; latest output from $agent: ---"
+      herdr agent read "$agent" --source recent-unwrapped --lines 80
+      echo "---"
+      echo "Ask the crewmate for findings, save them to $CREWS_DIR/$id/report.md, then retire."
+    fi
+    return 0
+  fi
+  echo "=== status ($tree) ==="; git -C "$tree" status --short
+  echo "=== commits $base..$branch ==="; git -C "$tree" log --oneline "$base..HEAD" --
+  echo "=== diff --stat ==="; git -C "$tree" diff --stat "$base...HEAD" --
+  cat <<EOF
+---
+Review the diff above (nakama read $id for full context).
+If tests are green and the diff is good, merge from the repo:
+  git -C $repo merge --no-ff $branch   # or: gh pr create for shared repos
+Then: nakama retire $id [--drop-branch]
+EOF
+}
+
+cmd_retire() {
+  local id="${1:-}" drop="0"; shift || true
+  [[ -n "$id" ]] || die "retire: <id> is required"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --drop-branch) drop="1"; shift ;; *) die "retire: unknown flag $1" ;; esac
+  done
+  local kind repo branch tab tree agent
+  kind=$(load_field "$id" kind); repo=$(load_field "$id" repo)
+  branch=$(load_field "$id" branch); tab=$(load_field "$id" tab)
+  agent=$(load_field "$id" agent); tree="$TREES_DIR/$id"
+  [[ -n "$tab" && "$tab" != "null" ]] && herdr tab close "$tab" || true
+  [[ -d "$tree" ]] && git -C "$repo" worktree remove --force "$tree" || true
+  if [[ "$kind" == "ship" && "$drop" == "1" ]]; then
+    git -C "$repo" branch -D "$branch" || true
+  fi
+  local f; f=$(task_file "$id")
+  jq '.status = "retired"' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+  echo "retired $id (agent was $agent)"
+}
+
 main() {
   need herdr; need git; need jq
   mkdir -p "$CREWS_DIR" "$TREES_DIR"
@@ -141,6 +208,10 @@ main() {
   case "$cmd" in
     spawn) cmd_spawn "$@" ;;
     list) cmd_list ;;
+    read) cmd_read "$@" ;;
+    wait) cmd_wait "$@" ;;
+    collect) cmd_collect "$@" ;;
+    retire) cmd_retire "$@" ;;
     -h|--help|help) usage ;;
     -V|--version|version) echo "nakama $VERSION" ;;
     *) die "unknown command: $cmd (see nakama --help)" ;;
